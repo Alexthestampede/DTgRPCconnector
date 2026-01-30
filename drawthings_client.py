@@ -30,8 +30,12 @@ Example usage:
 import grpc
 import flatbuffers
 import random
+import hashlib
+import tempfile
+from pathlib import Path
 from typing import Optional, Callable, List
 from dataclasses import dataclass, field
+from PIL import Image
 
 # Import generated protobuf files
 import imageService_pb2
@@ -91,6 +95,9 @@ class ImageGenerationConfig:
         face_restoration: Face restoration model (optional)
         refiner_model: Refiner model name (optional)
         hires_fix: Enable hires fix
+        hires_fix_start_width: Hires fix starting width in scale units (NOT pixels!)
+        hires_fix_start_height: Hires fix starting height in scale units (NOT pixels!)
+        hires_fix_strength: Hires fix strength (0.0-1.0, typically 0.7)
         tiled_decoding: Enable tiled decoding
         tiled_diffusion: Enable tiled diffusion
         mask_blur: Mask blur amount
@@ -100,6 +107,13 @@ class ImageGenerationConfig:
         cfg_zero_star: Enable CFG zero star
         cfg_zero_init_steps: CFG zero initialization steps
         causal_inference_pad: Causal inference padding
+        tea_cache: Enable TeaCache acceleration (timestep embedding aware cache)
+        stochastic_sampling_gamma: Strategic Stochastic Sampling gamma for TCD sampler (0.0-1.0, default 0.3)
+        original_image_width: Original image width in pixels (for edit models, optional)
+        original_image_height: Original image height in pixels (for edit models, optional)
+        target_image_width: Target image width in pixels (for edit models, optional)
+        target_image_height: Target image height in pixels (for edit models, optional)
+        image_guidance_scale: Image guidance scale for edit models (typically 1.5, optional)
     """
     model: str
     steps: int
@@ -118,6 +132,9 @@ class ImageGenerationConfig:
     face_restoration: str = ""
     refiner_model: str = ""
     hires_fix: bool = False
+    hires_fix_start_width: int = 0
+    hires_fix_start_height: int = 0
+    hires_fix_strength: float = 0.7
     tiled_decoding: bool = False
     tiled_diffusion: bool = False
     mask_blur: float = 2.5
@@ -127,6 +144,13 @@ class ImageGenerationConfig:
     cfg_zero_star: bool = False
     cfg_zero_init_steps: int = 0
     causal_inference_pad: int = 0
+    tea_cache: bool = False
+    stochastic_sampling_gamma: float = 0.3
+    original_image_width: Optional[int] = None
+    original_image_height: Optional[int] = None
+    target_image_width: Optional[int] = None
+    target_image_height: Optional[int] = None
+    image_guidance_scale: Optional[float] = None
 
     def __post_init__(self):
         """Generate random seed if not provided."""
@@ -160,14 +184,35 @@ class ImageGenerationConfig:
             SamplerType.SamplerType.UniPC
         )
 
+        # Convert pixels to scale units (server always uses 64 as divisor)
+        scale_width = self.width // 64
+        scale_height = self.height // 64
+
         # Build GenerationConfiguration
         GenerationConfiguration.Start(builder)
         GenerationConfiguration.AddId(builder, 0)
-        GenerationConfiguration.AddStartWidth(builder, self.width)
-        GenerationConfiguration.AddStartHeight(builder, self.height)
+        GenerationConfiguration.AddStartWidth(builder, scale_width)
+        GenerationConfiguration.AddStartHeight(builder, scale_height)
+
+        # Add edit-specific image dimensions if provided (for edit models like Qwen Edit)
+        # IMPORTANT: These must be added early, before Seed
+        if self.original_image_width is not None:
+            GenerationConfiguration.AddOriginalImageWidth(builder, self.original_image_width)
+        if self.original_image_height is not None:
+            GenerationConfiguration.AddOriginalImageHeight(builder, self.original_image_height)
+        if self.target_image_width is not None:
+            GenerationConfiguration.AddTargetImageWidth(builder, self.target_image_width)
+        if self.target_image_height is not None:
+            GenerationConfiguration.AddTargetImageHeight(builder, self.target_image_height)
+
         GenerationConfiguration.AddSeed(builder, self.seed)
         GenerationConfiguration.AddSteps(builder, self.steps)
         GenerationConfiguration.AddGuidanceScale(builder, self.cfg_scale)
+
+        # Add ImageGuidanceScale if provided (for edit models)
+        if self.image_guidance_scale is not None:
+            GenerationConfiguration.AddImageGuidanceScale(builder, self.image_guidance_scale)
+
         GenerationConfiguration.AddStrength(builder, self.strength)
         GenerationConfiguration.AddModel(builder, model_offset)
         GenerationConfiguration.AddSampler(builder, sampler_type)
@@ -187,6 +232,12 @@ class ImageGenerationConfig:
         if refiner_model_offset:
             GenerationConfiguration.AddRefinerModel(builder, refiner_model_offset)
         GenerationConfiguration.AddHiresFix(builder, self.hires_fix)
+        if self.hires_fix and self.hires_fix_start_width > 0:
+            GenerationConfiguration.AddHiresFixStartWidth(builder, self.hires_fix_start_width)
+        if self.hires_fix and self.hires_fix_start_height > 0:
+            GenerationConfiguration.AddHiresFixStartHeight(builder, self.hires_fix_start_height)
+        if self.hires_fix:
+            GenerationConfiguration.AddHiresFixStrength(builder, self.hires_fix_strength)
         GenerationConfiguration.AddMaskBlur(builder, self.mask_blur)
         GenerationConfiguration.AddMaskBlurOutset(builder, self.mask_blur_outset)
         GenerationConfiguration.AddSharpness(builder, self.sharpness)
@@ -196,6 +247,8 @@ class ImageGenerationConfig:
         GenerationConfiguration.AddCfgZeroStar(builder, self.cfg_zero_star)
         GenerationConfiguration.AddCfgZeroInitSteps(builder, self.cfg_zero_init_steps)
         GenerationConfiguration.AddCausalInferencePad(builder, self.causal_inference_pad)
+        GenerationConfiguration.AddTeaCache(builder, self.tea_cache)
+        GenerationConfiguration.AddStochasticSamplingGamma(builder, self.stochastic_sampling_gamma)
 
         config = GenerationConfiguration.End(builder)
 
@@ -233,6 +286,9 @@ class DrawThingsClient:
 
         # Channel options for compression and keep-alive
         options = [
+            # Message size limits (increased for large images)
+            ('grpc.max_send_message_length', 32 * 1024 * 1024),  # 32MB max send
+            ('grpc.max_receive_message_length', 32 * 1024 * 1024),  # 32MB max receive
             # Keep-alive settings to prevent connection drops during long operations
             ('grpc.keepalive_time_ms', 30000),  # Send keepalive ping every 30 seconds
             ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive response
@@ -318,6 +374,8 @@ class DrawThingsClient:
         config: ImageGenerationConfig,
         negative_prompt: str = "",
         scale_factor: int = 1,
+        input_image: Optional[bytes] = None,
+        metadata_override: Optional[any] = None,
         progress_callback: Optional[Callable[[str, int], None]] = None,
         preview_callback: Optional[Callable[[bytes], None]] = None
     ) -> List[bytes]:
@@ -328,6 +386,10 @@ class DrawThingsClient:
             config: Image generation configuration
             negative_prompt: Negative prompt (optional)
             scale_factor: Image scale factor
+            input_image: Optional input image bytes (PIL Image format) for img2img/edit.
+                        Will be automatically resized to match config dimensions.
+            metadata_override: Optional MetadataOverride protobuf object for LoRA metadata.
+                              Used when LoRAs need to be specified with version info.
             progress_callback: Optional callback for progress updates.
                                Called with (stage_name, step_number)
             preview_callback: Optional callback for preview images.
@@ -349,16 +411,62 @@ class DrawThingsClient:
         # Build FlatBuffer configuration
         config_bytes = config.to_flatbuffer()
 
+        # Process input image if provided
+        image_hash = None
+        image_tensor = None
+        if input_image is not None:
+            # Import tensor encoder
+            from tensor_encoder import encode_image_to_tensor
+
+            # Load image from bytes
+            from io import BytesIO
+            pil_img = Image.open(BytesIO(input_image))
+
+            # Convert to RGB if needed
+            if pil_img.mode != 'RGB':
+                pil_img = pil_img.convert('RGB')
+
+            # Resize to match config dimensions
+            target_size = (config.width, config.height)
+            if pil_img.size != target_size:
+                pil_img = pil_img.resize(target_size, Image.Resampling.LANCZOS)
+
+            # Save to temporary file for encoding
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                tmp_path = tmp.name
+                pil_img.save(tmp_path)
+
+            try:
+                # Encode to tensor format
+                image_tensor = encode_image_to_tensor(tmp_path, compress=True)
+
+                # Calculate SHA256 hash
+                image_hash = hashlib.sha256(image_tensor).digest()
+            finally:
+                # Clean up temp file
+                Path(tmp_path).unlink(missing_ok=True)
+
         # Create gRPC request
-        request = imageService_pb2.ImageGenerationRequest(
-            prompt=prompt,
-            negativePrompt=negative_prompt,
-            configuration=config_bytes,
-            scaleFactor=scale_factor,
-            user="DrawThingsPythonClient",
-            device=imageService_pb2.LAPTOP,
-            chunked=True  # Accept chunked responses
-        )
+        request_kwargs = {
+            'prompt': prompt,
+            'negativePrompt': negative_prompt,
+            'configuration': config_bytes,
+            'scaleFactor': scale_factor,
+            'user': "DrawThingsPythonClient",
+            'device': imageService_pb2.LAPTOP,
+            'chunked': True  # Accept chunked responses
+        }
+
+        # Add image data if provided
+        if image_hash is not None and image_tensor is not None:
+            request_kwargs['image'] = image_hash
+            request_kwargs['contents'] = [image_tensor]
+
+        # Add metadata override if provided (for LoRA metadata)
+        if metadata_override is not None:
+            request_kwargs['override'] = metadata_override
+
+        request = imageService_pb2.ImageGenerationRequest(**request_kwargs)
 
         # Stream response
         generated_images = []
