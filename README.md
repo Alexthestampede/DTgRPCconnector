@@ -22,6 +22,13 @@ A comprehensive Python client library for the [Draw Things](https://drawthings.a
 pip install grpcio grpcio-tools flatbuffers fpzip Pillow numpy
 ```
 
+## TLS Certificate — Required for Secure Connections
+
+**TLS will fail without the Draw Things root CA certificate.** Download `root_ca.crt` from:
+https://github.com/drawthingsai/draw-things-community/tree/main/Libraries/BinaryResources/Resources
+
+Place it as `root_ca.crt` in the working directory, or pass the path via `ssl_cert_path` when creating the client.
+
 ## Quick Start
 
 ### List Available Models
