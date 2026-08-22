@@ -32,6 +32,7 @@ import flatbuffers
 import random
 import hashlib
 import tempfile
+import subprocess
 from pathlib import Path
 from typing import Optional, Callable, List
 from dataclasses import dataclass, field
@@ -145,6 +146,14 @@ class ReferenceImage:
     image: any  # PIL Image, path str, or bytes
     weight: float = 1.0
     hint_type: str = "shuffle"  # or "ipadapterplus", "ipadapterfull", etc.
+
+
+@dataclass
+class GenerationResult:
+    """Result container for media generation (images / video frames + audio)."""
+
+    images: List[bytes]
+    audio: List[bytes]
 
 
 @dataclass
@@ -316,12 +325,14 @@ class ImageGenerationConfig:
     stage_2_steps: int = 10
     stage_2_cfg: float = 1.0
     stage_2_shift: float = 1.0
-    # Video generation (SVD)
+    # Video generation (SVD / LTX)
     fps_id: int = 5
     motion_bucket_id: int = 127
     cond_aug: float = 0.02
     start_frame_cfg: float = 1.0
     num_frames: int = 14
+    compression_artifacts: int = 0  # CompressionMethod: Disabled=0, H264=1, H265=2, Jpeg=3
+    compression_artifacts_quality: float = 43.1
     # LoRA and ControlNet
     loras: List[LoRAConfig] = field(default_factory=list)
     controls: List[ControlNetConfig] = field(default_factory=list)
@@ -571,6 +582,13 @@ class ImageGenerationConfig:
         # CFG zero
         GenerationConfiguration.AddCfgZeroStar(builder, self.cfg_zero_star)
         GenerationConfiguration.AddCfgZeroInitSteps(builder, self.cfg_zero_init_steps)
+        # Video compression artifacts (LTX, etc.)
+        GenerationConfiguration.AddCompressionArtifacts(
+            builder, self.compression_artifacts
+        )
+        GenerationConfiguration.AddCompressionArtifactsQuality(
+            builder, self.compression_artifacts_quality
+        )
 
         config = GenerationConfiguration.End(builder)
         builder.Finish(config)
@@ -772,7 +790,7 @@ class DrawThingsClient:
 
         return bytes(header) + pixel_data
 
-    def generate_image(
+    def generate_media(
         self,
         prompt: str,
         config: ImageGenerationConfig,
@@ -785,14 +803,17 @@ class DrawThingsClient:
         metadata_override=None,
         progress_callback: Optional[Callable[[str, int], None]] = None,
         preview_callback: Optional[Callable[[bytes], None]] = None,
-    ) -> List[bytes]:
-        """Generate image(s) using the specified configuration.
+    ) -> GenerationResult:
+        """Generate media (images/video frames + optional audio) using the specified configuration.
+
+        This is the lower-level method that also captures generated audio for video models.
+        For image-only generation, use generate_image() which is a convenience wrapper.
 
         Args:
-            prompt: Text prompt for image generation
-            config: Image generation configuration
+            prompt: Text prompt for image/video generation
+            config: Image/video generation configuration
             negative_prompt: Negative prompt
-            scale_factor: Image scale factor
+            scale_factor: Image/video scale factor
             input_image: Input image for img2img/edit (PIL Image, path, or bytes)
             mask_image: Mask image for inpainting (PIL Image, path, or bytes).
                        White=inpaint area, black=preserve area.
@@ -803,7 +824,9 @@ class DrawThingsClient:
             preview_callback: Callback for preview images
 
         Returns:
-            List of generated image data as bytes
+            GenerationResult containing:
+            - images: List of generated image/video frame data as bytes
+            - audio: List of audio chunks (empty for image-only generation)
         """
         config_bytes = config.to_flatbuffer()
 
@@ -893,6 +916,7 @@ class DrawThingsClient:
 
         # Stream response
         generated_images = []
+        generated_audio = []
         image_chunks = []
 
         try:
@@ -935,6 +959,10 @@ class DrawThingsClient:
                 if response.HasField("previewImage") and preview_callback:
                     preview_callback(response.previewImage)
 
+                # Collect generated audio (e.g. LTX video models)
+                if response.generatedAudio:
+                    generated_audio.extend(response.generatedAudio)
+
                 # Handle chunked responses
                 if response.generatedImages:
                     for img_data in response.generatedImages:
@@ -951,7 +979,58 @@ class DrawThingsClient:
         except grpc.RpcError as e:
             raise Exception(f"gRPC error: {e.code()}: {e.details()}")
 
-        return generated_images
+        return GenerationResult(images=generated_images, audio=generated_audio)
+
+    def generate_image(
+        self,
+        prompt: str,
+        config: ImageGenerationConfig,
+        negative_prompt: str = "",
+        scale_factor: int = 1,
+        input_image=None,
+        mask_image=None,
+        hints: Optional[List] = None,
+        reference_images: Optional[List] = None,
+        metadata_override=None,
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        preview_callback: Optional[Callable[[bytes], None]] = None,
+    ) -> List[bytes]:
+        """Generate image(s) using the specified configuration.
+
+        Convenience wrapper around generate_media() that discards any generated audio
+        and returns only image bytes. Use generate_media() directly for video/audio support.
+
+        Args:
+            prompt: Text prompt for image generation
+            config: Image generation configuration
+            negative_prompt: Negative prompt
+            scale_factor: Image scale factor
+            input_image: Input image for img2img/edit (PIL Image, path, or bytes)
+            mask_image: Mask image for inpainting (PIL Image, path, or bytes).
+                       White=inpaint area, black=preserve area.
+            hints: List of HintProto objects for ControlNet hints
+            reference_images: List of ReferenceImage objects for moodboard/references
+            metadata_override: MetadataOverride protobuf object (for LoRA metadata)
+            progress_callback: Callback for progress (stage_name, step_number)
+            preview_callback: Callback for preview images
+
+        Returns:
+            List of generated image data as bytes
+        """
+        result = self.generate_media(
+            prompt=prompt,
+            config=config,
+            negative_prompt=negative_prompt,
+            scale_factor=scale_factor,
+            input_image=input_image,
+            mask_image=mask_image,
+            hints=hints,
+            reference_images=reference_images,
+            metadata_override=metadata_override,
+            progress_callback=progress_callback,
+            preview_callback=preview_callback,
+        )
+        return result.images
 
     def files_exist(self, files: List[str]) -> dict:
         """Check if files exist on the server.
@@ -996,6 +1075,87 @@ class DrawThingsClient:
             saved_files.append(str(filepath))
 
         return saved_files
+
+    def save_video(
+        self,
+        frames: List[bytes],
+        output_path: str,
+        fps: int = 24,
+        audio: Optional[bytes] = None,
+        audio_sample_rate: int = 44100,
+    ) -> str:
+        """Assemble decoded video frames into a playable video file.
+
+        Uses imageio for frame muxing and FFmpeg (via imageio-ffmpeg) for audio muxing.
+        Falls back to frame-only output if imageio is unavailable.
+
+        Args:
+            frames: List of decoded frame bytes (PNG or tensor chunks decoded by client)
+            output_path: Path for output video file (e.g. "output.mp4")
+            fps: Frames per second
+            audio: Optional raw audio bytes (stereo, typically from LTX 2.3)
+            audio_sample_rate: Sample rate of the provided audio bytes
+
+        Returns:
+            Path to the saved video file
+        """
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try imageio first
+        try:
+            import imageio
+
+            # Write frames-only video
+            writer = imageio.get_writer(output_path, fps=fps, codec="libx264")
+            for frame_bytes in frames:
+                frame = imageio.imread(frame_bytes)
+                writer.append_data(frame)
+            writer.close()
+
+            # If audio is provided, try to mux it in
+            if audio:
+                try:
+                    import imageio_ffmpeg
+
+                    temp_video = output.with_suffix(".temp" + output.suffix)
+                    output.rename(temp_video)
+
+                    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+                    cmd = [
+                        ffmpeg_path,
+                        "-y",
+                        "-i",
+                        str(temp_video),
+                        "-f",
+                        "f32le",
+                        "-ar",
+                        str(audio_sample_rate),
+                        "-ac",
+                        "2",
+                        "-i",
+                        "-",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                        str(output),
+                    ]
+                    subprocess.run(cmd, input=audio, check=True)
+                    temp_video.unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"Warning: Could not mux audio: {e}")
+                    # Keep frames-only video
+                    if not output.exists() and temp_video.exists():
+                        temp_video.rename(output)
+
+            return str(output)
+        except ImportError:
+            raise ImportError(
+                "Video assembly requires imageio and imageio-ffmpeg. "
+                "Install: pip install imageio imageio-ffmpeg"
+            )
 
 
 class StreamingProgressHandler:
