@@ -226,7 +226,7 @@ with DrawThingsClient("server.example.com:7859", insecure=False, verify_ssl=Fals
         result.images,
         output_path="output/video.mp4",
         fps=24,
-        audio=b"".join(result.audio) if result.audio else None,
+        audio=result.audio if result.audio else None,
     )
 ```
 
@@ -296,11 +296,13 @@ client.save_video(
     result.images,
     output_path="output/video.mp4",
     fps=24,
-    audio=b"".join(result.audio) if result.audio else None,
+    audio=result.audio if result.audio else None,
 )
 ```
 
 `save_video()` requires `imageio` and `imageio-ffmpeg` (`pip install imageio imageio-ffmpeg`).
+
+**Audio is a tensor too.** Each entry in `result.audio` is a fpzip-compressed CCV tensor of shape `(channels, samples)` (stereo: `(2, N)`), float values in `[-1.0, 1.0]`, chunked exactly like image tensors. `save_video()` decodes them to interleaved float32 PCM and muxes via FFmpeg. Sample rates: **48 kHz for LTX 2.3**, 24 kHz for most other models (matching upstream `ModelZoo.audioSampleRateForModel`).
 
 ---
 
@@ -622,7 +624,8 @@ config = ImageGenerationConfig(
 ### Video Generation / LTX Notes
 
 - **Audio**: The gRPC server returns `generatedAudio` alongside frames for video models (LTX 2.x). `generate_media()` collects it; `generate_image()` silently discards it.
-- **Audio format**: Raw stereo float32 PCM (44.1 kHz typical). `save_video()` muxes it into the MP4 via FFmpeg.
+- **Audio is a tensor**: fpzip-compressed CCV tensor, shape `(channels, samples)` (stereo `(2, N)`), values in `[-1.0, 1.0]`, chunked like images. `save_video()` decodes to interleaved float32 PCM and muxes via FFmpeg.
+- **Sample rate**: 48 kHz for LTX 2.3; 24 kHz default for other models (upstream `ModelZoo.audioSampleRateForModel`).
 - **LTX scale factors**: LTX models use different VAE ratios than image models — the server internally uses `startScaleFactor = 32` and doubles the scale. Pass pixel dimensions that are multiples of 64 (540p, 720p, etc.) to avoid reshape crashes.
 - **Frames are not a video**: The response contains individual decoded frames, not a multiplexed file. Use `save_video()` (or mux externally with FFmpeg).
 - **batch_count/batch_size are ignored for video models**: The server forces batch size to 1 for video models regardless of config.
@@ -691,7 +694,7 @@ gRPC/
 ├── drawthings_client.py         # Main client: DrawThingsClient, ImageGenerationConfig,
 │                                #   LoRAConfig, ControlNetConfig, ReferenceImage, GenerationResult
 ├── model_metadata.py            # Model discovery / latent size detection
-├── tensor_decoder.py            # Decode CCV tensors to PNG (auto-detects fpzip)
+├── tensor_decoder.py            # Decode CCV tensors to PNG (auto-detects fpzip) + audio tensors
 ├── tensor_encoder.py            # Encode images to CCV tensor format
 ├── GenerationConfiguration.py   # FlatBuffer schema (86 fields)
 ├── LoRA.py                      # FlatBuffer LoRA table

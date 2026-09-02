@@ -918,6 +918,7 @@ class DrawThingsClient:
         generated_images = []
         generated_audio = []
         image_chunks = []
+        audio_chunks = []
 
         try:
             for response in self.stub.GenerateImage(request):
@@ -959,9 +960,16 @@ class DrawThingsClient:
                 if response.HasField("previewImage") and preview_callback:
                     preview_callback(response.previewImage)
 
-                # Collect generated audio (e.g. LTX video models)
+                # Handle chunked audio responses (e.g. LTX video models).
+                # Audio arrives as fpzip-compressed CCV tensors, chunked exactly
+                # like images: accumulate on MORE_CHUNKS, decode on LAST_CHUNK.
                 if response.generatedAudio:
-                    generated_audio.extend(response.generatedAudio)
+                    audio_chunks.extend(response.generatedAudio)
+
+                    if response.chunkState == imageService_pb2.LAST_CHUNK:
+                        combined_audio = b"".join(audio_chunks)
+                        generated_audio.append(combined_audio)
+                        audio_chunks = []
 
                 # Handle chunked responses
                 if response.generatedImages:
@@ -1081,8 +1089,8 @@ class DrawThingsClient:
         frames: List[bytes],
         output_path: str,
         fps: int = 24,
-        audio: Optional[bytes] = None,
-        audio_sample_rate: int = 44100,
+        audio: Optional[List[bytes]] = None,
+        audio_sample_rate: int = 24000,
     ) -> str:
         """Assemble decoded video frames into a playable video file.
 
@@ -1090,11 +1098,15 @@ class DrawThingsClient:
         Falls back to frame-only output if imageio is unavailable.
 
         Args:
-            frames: List of decoded frame bytes (PNG or tensor chunks decoded by client)
+            frames: List of decoded frame bytes (PNG)
             output_path: Path for output video file (e.g. "output.mp4")
             fps: Frames per second
-            audio: Optional raw audio bytes (stereo, typically from LTX 2.3)
-            audio_sample_rate: Sample rate of the provided audio bytes
+            audio: Optional list of audio tensor chunks from GenerationResult.audio
+                   (fpzip-compressed CCV tensors, shape (channels, samples)).
+                   They are decoded to interleaved float32 PCM before muxing.
+                   Pass a single pre-decoded bytes object to skip decoding.
+            audio_sample_rate: Sample rate for the audio. 48000 for LTX 2.3,
+                   24000 for most other models (upstream ModelZoo default).
 
         Returns:
             Path to the saved video file
@@ -1113,10 +1125,29 @@ class DrawThingsClient:
                 writer.append_data(frame)
             writer.close()
 
-            # If audio is provided, try to mux it in
+            # If audio is provided, decode tensors and mux it in
             if audio:
                 try:
                     import imageio_ffmpeg
+
+                    # Each entry in GenerationResult.audio is one reassembled
+                    # fpzip-compressed CCV tensor (shape (channels, samples)),
+                    # matching the upstream client which decodes every
+                    # generatedAudio element individually. Decode each and
+                    # concatenate the interleaved float32 PCM. A single entry
+                    # that is not a tensor is passed through as raw PCM.
+                    from tensor_decoder import decode_audio_tensor
+
+                    pcm_parts = []
+                    n_channels = 2
+                    for entry in audio:
+                        try:
+                            pcm, n_channels, _ = decode_audio_tensor(entry)
+                            pcm_parts.append(pcm)
+                        except ValueError:
+                            pcm_parts.append(entry)
+
+                    pcm_bytes = b"".join(pcm_parts)
 
                     temp_video = output.with_suffix(".temp" + output.suffix)
                     output.rename(temp_video)
@@ -1132,7 +1163,7 @@ class DrawThingsClient:
                         "-ar",
                         str(audio_sample_rate),
                         "-ac",
-                        "2",
+                        str(n_channels),
                         "-i",
                         "-",
                         "-c:v",
@@ -1142,7 +1173,7 @@ class DrawThingsClient:
                         "-shortest",
                         str(output),
                     ]
-                    subprocess.run(cmd, input=audio, check=True)
+                    subprocess.run(cmd, input=pcm_bytes, check=True)
                     temp_video.unlink(missing_ok=True)
                 except Exception as e:
                     print(f"Warning: Could not mux audio: {e}")

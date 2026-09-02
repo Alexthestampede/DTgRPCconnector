@@ -122,6 +122,8 @@ For edit models, use `"shuffle"` with `strength=1.0` in the config.
 
 - Use `generate_media()` to capture frames **and** audio (`GenerationResult.images` / `.audio`); `generate_image()` still returns just `List[bytes]` and discards audio (kept for backward compatibility).
 - `save_video()` muxes frames + audio into MP4; requires optional `imageio`/`imageio-ffmpeg` deps.
-- Audio is raw stereo float32 PCM; only produced by video models (LTX, etc.) — image models return empty audio.
+- **Audio is a tensor too**: each `GenerationResult.audio` entry is a reassembled fpzip-compressed CCV tensor, shape `(channels, samples)` (stereo `(2, N)`), values in `[-1.0, 1.0]` — chunked exactly like image tensors (accumulate on MORE_CHUNKS, decode on LAST_CHUNK; upstream decodes each element of `generatedAudio` individually).
+- `tensor_decoder.decode_audio_tensor()` converts an audio tensor to interleaved float32 PCM; `save_video()` calls it per entry.
+- Sample rate: 48 kHz for LTX 2.3, 24 kHz default (upstream `ModelZoo.audioSampleRateForModel`).
 - LTX VAE ratios differ from image models (server uses `startScaleFactor = 32` and doubles scale); pass pixel dims in multiples of 64.
 - Server forces batch size 1 for video models regardless of config.
