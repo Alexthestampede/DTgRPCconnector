@@ -873,7 +873,7 @@ with DrawThingsClient("server.example.com:7859", insecure=False, verify_ssl=Fals
         config=config,
         input_image="first_frame.png",
     )
-    # Returns individual frame tensors; assemble into video externally
+    # Returns individual decoded frames; use save_video() to mux into an MP4
     client.save_images(images, output_dir="output/frames", prefix="frame")
 ```
 
@@ -1069,6 +1069,14 @@ Pixel values:
 
 This format matches the Swift reference client's `ImageHelpers.imageToDTTensor()` implementation from [euphoriacyberware-ai/DT-gRPC-Swift-Client](https://github.com/euphoriacyberware-ai/DT-gRPC-Swift-Client).
 
+> **⚠️ Response tensors are (likely) fpzip-compressed.** Unless the server is started
+> with `--no-response-compression`, the Draw Things gRPC server sends **all** response
+> data (images, video frames, masks, hints) as fpzip-compressed float32 tensors —
+> header magic `[0] = 1012247`. `tensor_decoder.decode_tensor()` auto-detects this
+> from the magic value and decompresses transparently, but `fpzip` must be installed.
+> Note the direction: response data is compressed, while **input images you send**
+> stay uncompressed float16 (for edit/kontext fidelity).
+
 ### Batch Generation
 
 ```python
@@ -1175,3 +1183,9 @@ Some model/configuration combinations cause the server to crash. Try:
 - Verify the ControlNet model filename is correct and the file exists on server
 - Confirm `input_override` matches the type of guide image you are providing
 - Try `weight=1.0` and `guidance_start=0.0, guidance_end=1.0` first, then tune
+
+### Video generation issues (LTX)
+
+- `save_video()` raises `ImportError` — install: `pip install imageio imageio-ffmpeg`
+- No audio in output — confirm you used `generate_media()` (`generate_image()` discards audio) and passed `audio=b"".join(result.audio)`
+- Server crash / reshape errors — use dimensions in multiples of 64 (540p, 720p); LTX uses different VAE ratios and the server forces batch size 1
