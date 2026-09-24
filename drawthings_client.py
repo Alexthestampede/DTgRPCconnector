@@ -1149,6 +1149,26 @@ class DrawThingsClient:
 
                     pcm_bytes = b"".join(pcm_parts)
 
+                    # LTX's AudioVAE can emit NaN/Inf or wildly out-of-range
+                    # samples that break AAC encoding. Sanitize before muxing:
+                    # replace invalid samples with silence, clamp to [-1, 1].
+                    try:
+                        import numpy as _np
+
+                        arr = _np.frombuffer(pcm_bytes, dtype=_np.float32).copy()
+                        if arr.size:
+                            had_invalid = not _np.isfinite(arr).all()
+                            arr = _np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                            arr = _np.clip(arr, -1.0, 1.0)
+                            if had_invalid:
+                                print(
+                                    "Warning: Sanitized invalid audio samples "
+                                    "(NaN/Inf) before muxing."
+                                )
+                            pcm_bytes = arr.astype(_np.float32).tobytes()
+                    except Exception:
+                        pass  # If sanitization fails, attempt mux with raw PCM
+
                     temp_video = output.with_suffix(".temp" + output.suffix)
                     output.rename(temp_video)
 
